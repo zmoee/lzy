@@ -16,8 +16,18 @@ export type UploadResponse = {
   parts: number
 }
 
-/** 蓝奏云免费账号的单文件上限，与服务端保持一致 */
+/** 蓝奏云免费账号的单文件上限，与服务端保持一致。超过它就得切块。 */
 export const MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+
+/** 分块上传：begin 交底"切几块、每块多大、哪些块已经在网盘上"。 */
+type BeginResponse = {
+  folder_id: string
+  folder_name: string
+  uploaded: number[]
+  parts: number
+  part_size: number
+  size: number
+}
 
 export type ListResponse = {
   files: LanzouFile[]
@@ -92,9 +102,9 @@ export const folderDownloadUrl = (folder: LanzouFolder) =>
   `/api/folder/${folder.id}/download?name=${encodeURIComponent(folder.name)}`
 
 /** 上传走 XHR：只有这样才能拿到真实的 upload.onprogress。 */
-export function uploadFile(
+function uploadOne(
   file: File,
-  folderId = -1,
+  folderId: number,
   onProgress?: (pct: number) => void,
 ): Promise<UploadResponse> {
   return new Promise((resolve, reject) => {
@@ -119,9 +129,79 @@ export function uploadFile(
       } catch {
         /* 保留默认信息 */
       }
-      reject(new Error(detail))
+      reject(new ApiError(detail, xhr.status))
     }
     xhr.onerror = () => reject(new Error('网络错误，上传中断'))
     xhr.send(file)
   })
+}
+
+/** 失败就重来，退避 2s / 4s。登录失效不重试，重试也是白搭。 */
+async function retry<T>(fn: () => Promise<T>, times = 3): Promise<T> {
+  for (let n = 1; ; n++) {
+    try {
+      return await fn()
+    } catch (err) {
+      if (err instanceof ApiError && err.needsLogin) throw err
+      if (n >= times) throw err
+      await new Promise((r) => setTimeout(r, n * 2000))
+    }
+  }
+}
+
+/**
+ * 分块上传。一块一个请求，超时和断线只影响一块。
+ *
+ * 以前是「一个请求把 700MB 整个发给本机服务、服务端内部再切块转发」：那个请求
+ * 要活好几分钟，中间任何一层掐断就整单白传，前端还只能干看着进度条停在 100%。
+ * 现在进度是按块数出来的真进度，断了再点一次也只补缺的块。
+ */
+async function uploadChunked(
+  file: File,
+  folderId: number,
+  onProgress?: (pct: number) => void,
+): Promise<UploadResponse> {
+  const begin = await req<BeginResponse>('/api/upload/begin', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filename: file.name, folder_id: folderId, size: file.size }),
+  })
+
+  const have = new Set(begin.uploaded)
+  let done = have.size
+  onProgress?.((done / begin.parts) * 100)
+
+  for (let i = 1; i <= begin.parts; i++) {
+    if (have.has(i)) continue
+    const from = (i - 1) * begin.part_size
+    const chunk = file.slice(from, Math.min(from + begin.part_size, file.size))
+    await retry(() =>
+      req<unknown>(
+        `/api/upload/part?folder_id=${begin.folder_id}&filename=${encodeURIComponent(file.name)}&idx=${i}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body: chunk,
+        },
+      ),
+    )
+    onProgress?.(++done / begin.parts * 100)
+  }
+
+  return req<UploadResponse>('/api/upload/finish', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ folder_id: begin.folder_id, filename: file.name, parts: begin.parts }),
+  })
+}
+
+/** 上传入口。小文件一个请求搞定，大文件自动切块。 */
+export function uploadFile(
+  file: File,
+  folderId = -1,
+  onProgress?: (pct: number) => void,
+): Promise<UploadResponse> {
+  return file.size > MAX_UPLOAD_BYTES
+    ? uploadChunked(file, folderId, onProgress)
+    : uploadOne(file, folderId, onProgress)
 }

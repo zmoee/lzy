@@ -197,7 +197,7 @@ export default function App() {
   async function handlePick(picked: File[]) {
     setError(null)
     for (const file of picked) {
-      // 超过单文件上限的会被服务端切成多块、装进一个新的同名文件夹
+      // 超过单文件上限的会切成多块、装进一个新的同名文件夹
       const willSplit = file.size > MAX_UPLOAD_BYTES
       const tempId = `local-${Date.now()}-${seq++}`
       setFiles((prev) => [
@@ -215,19 +215,10 @@ export default function App() {
         ...prev,
       ])
       try {
+        // 大文件走切块：这里的 pct 是"已传块数 / 总块数"的真进度
         const res = await uploadFile(file, folderId, (pct) => {
           setFiles((prev) =>
-            prev.map((item) =>
-              item.id === tempId
-                ? {
-                    ...item,
-                    progress: pct,
-                    // 进度条量的是"传到本机服务"这一段。大文件传完之后服务端还要
-                    // 逐块转发到网盘，那段时间进度条一直是满的，得把话说清楚。
-                    time: willSplit && pct >= 99.5 ? '逐块上传到网盘…' : item.time,
-                  }
-                : item,
-            ),
+            prev.map((item) => (item.id === tempId ? { ...item, progress: pct } : item)),
           )
         })
 

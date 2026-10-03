@@ -134,6 +134,71 @@ fn handle(app: Arc<Server>, mut req: Request) {
             }
         }
 
+        // ---- 分卷上传（前端切块，一块一个请求）----
+
+        (Method::Post, "/api/upload/begin") => {
+            let v: serde_json::Value = match read_json(&mut req, 64 * 1024) {
+                Ok(v) => v,
+                Err(e) => return fail_msg(req, 400, &e),
+            };
+            let filename = v.get("filename").and_then(|x| x.as_str()).unwrap_or("");
+            let folder_id = v.get("folder_id").and_then(|x| x.as_i64()).unwrap_or(lanzou::ROOT);
+            let size = v.get("size").and_then(|x| x.as_u64()).unwrap_or(0);
+            if filename.is_empty() || size == 0 {
+                return fail_msg(req, 400, "缺少 filename 或 size");
+            }
+            match app.upload_begin(filename, folder_id, size) {
+                Ok(res) => json_value(req, 200, &res),
+                Err(e) => fail(req, &e),
+            }
+        }
+
+        (Method::Post, "/api/upload/part") => {
+            let folder_id = q_str(&query, "folder_id").unwrap_or_default();
+            let filename = q_str(&query, "filename").unwrap_or_default();
+            let idx = q_i64(&query, "idx", 0);
+            if folder_id.is_empty() || filename.is_empty() || idx < 1 {
+                return fail_msg(req, 400, "缺少 folder_id / filename / idx");
+            }
+            // 单块也受服务端 100M 上限约束，多读 1 字节用来判断
+            let data = match req
+                .as_reader()
+                .bytes()
+                .take(crate::server::MAX_UPLOAD_BYTES as usize + 1)
+                .collect::<Result<Vec<u8>, _>>()
+            {
+                Ok(d) => d,
+                Err(e) => return fail_msg(req, 400, &format!("读取分块失败: {e}")),
+            };
+            if data.is_empty() {
+                return fail_msg(req, 400, "空分块");
+            }
+            if data.len() as u64 > crate::server::MAX_UPLOAD_BYTES {
+                return fail_msg(req, 413, "分块超过 100 M 上限");
+            }
+            match app.upload_part(&folder_id, idx as usize, &filename, data) {
+                Ok(()) => json(req, 200, &format!("{{\"ok\":true,\"idx\":{idx}}}")),
+                Err(e) => fail(req, &e),
+            }
+        }
+
+        (Method::Post, "/api/upload/finish") => {
+            let v: serde_json::Value = match read_json(&mut req, 64 * 1024) {
+                Ok(v) => v,
+                Err(e) => return fail_msg(req, 400, &e),
+            };
+            let folder_id = v.get("folder_id").and_then(|x| x.as_str()).unwrap_or("");
+            let filename = v.get("filename").and_then(|x| x.as_str()).unwrap_or("");
+            let parts = v.get("parts").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+            if folder_id.is_empty() || filename.is_empty() || parts == 0 {
+                return fail_msg(req, 400, "缺少 folder_id / filename / parts");
+            }
+            match app.upload_finish(folder_id, filename, parts) {
+                Ok(res) => json_value(req, 200, &res),
+                Err(e) => fail(req, &e),
+            }
+        }
+
         (Method::Post, "/api/relogin") => match app.relogin() {
             Ok(uid) => json(req, 200, &format!("{{\"uid\":{}}}", json_str(&uid))),
             Err(e) => fail(req, &e),
@@ -364,11 +429,12 @@ fn json_value<T: serde::Serialize>(req: Request, status: u16, v: &T) {
 }
 
 fn fail(req: Request, err: &LzError) {
-    // 两种"该弹登录卡"的情况都走 401：没配置账号、会话失效
-    let status = if matches!(err, LzError::NotConfigured | LzError::NotLoggedIn) {
-        401
-    } else {
-        400
+    let status = match err {
+        // 两种"该弹登录卡"的情况都走 401：没配置账号、会话失效
+        LzError::NotConfigured | LzError::NotLoggedIn => 401,
+        // 蓝奏云或它前面那道网关自己抽风（实测遇到 504），跟请求内容无关，重试就好
+        LzError::Http(_) => 502,
+        _ => 400,
     };
     fail_msg(req, status, &err.to_string());
 }
@@ -393,6 +459,17 @@ fn is_loopback_host(host: &str) -> bool {
         None => host.split(':').next().unwrap_or(""),
     };
     matches!(name, "127.0.0.1" | "localhost" | "::1")
+}
+
+/// 读一个小 JSON 请求体。
+fn read_json(req: &mut Request, limit: u64) -> Result<serde_json::Value, String> {
+    let body = req
+        .as_reader()
+        .bytes()
+        .take(limit as usize)
+        .collect::<Result<Vec<u8>, _>>()
+        .map_err(|e| format!("读取请求体失败: {e}"))?;
+    serde_json::from_slice(&body).map_err(|e| format!("请求格式不对: {e}"))
 }
 
 // ---------- URL / query ----------

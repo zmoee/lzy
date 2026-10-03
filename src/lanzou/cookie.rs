@@ -162,10 +162,22 @@ mod tests {
         assert!(header_for(&sess, url).contains("ylogin=1234567"));
     }
 
+    /// 会话只认同一个账号：换了账号必须当没登录过，否则会拿着别人的会话干活。
+    /// 顺带覆盖"文件不存在"（第一次跑）也得当成没有会话，而不是报错。
+    ///
+    /// 两件事写在一个测试里，是因为它们都要改 `LANZOU_COOKIE_FILE` 这个**进程全局**变量：
+    /// 拆成两个测试并行跑时，一个刚设好的路径会被另一个覆盖，测试就随机失败。
     #[test]
-    fn other_account_cookie_is_not_reused() {
+    fn restore_only_reuses_same_account() {
         let path = "/tmp/lzy-cookie-acct-test.json";
         std::env::set_var("LANZOU_COOKIE_FILE", path);
+
+        // 先测没有文件的情况
+        let _ = std::fs::remove_file(path);
+        let sess = Session::new().expect("建会话");
+        assert_eq!(restore(&sess, "someone"), "", "没有存过就当没会话");
+
+        // 存一个 alice 的会话
         std::fs::write(
             path,
             r#"{"user":"alice","up":"ylogin=1","acc":"","saved_at":0}"#,
@@ -176,12 +188,5 @@ mod tests {
         assert_eq!(restore(&sess, "bob"), "", "换了账号就不该复用旧会话");
         assert_eq!(restore(&sess, "alice"), "1", "同一个账号才复用");
         let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn missing_file_is_not_an_error() {
-        std::env::set_var("LANZOU_COOKIE_FILE", "/tmp/lzy-nonexistent-cookie.json");
-        let sess = Session::new().expect("建会话");
-        assert_eq!(restore(&sess, "someone"), "");
     }
 }

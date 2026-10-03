@@ -4,7 +4,7 @@
 //! MCP 工具和 HTTP 处理器共用这里的方法，所以业务逻辑都写成 `Server` 的方法，
 //! 调用方只负责解析参数、调方法、把结果转成自己的格式。
 
-use std::io::{Cursor, Read};
+use std::io::{self, Read};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -32,7 +32,20 @@ pub fn part_size() -> u64 {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|&n| n > 0)
+        // 只能往小调：往上调没意义，服务端硬上限就在那儿，调大了每块都会被拒
+        .map(|n| n.min(MAX_UPLOAD_BYTES))
         .unwrap_or(MAX_UPLOAD_BYTES)
+}
+
+/// 这么大要切成几块。
+pub fn part_count(size: u64, ps: u64) -> usize {
+    size.div_ceil(ps) as usize
+}
+
+/// 第 `idx` 块（从 1 开始）在文件里的起点和长度。
+pub fn part_bounds(size: u64, ps: u64, idx: usize) -> (u64, u64) {
+    let from = (idx as u64 - 1) * ps;
+    (from, size.saturating_sub(from).min(ps))
 }
 
 /// 翻页上限，防止接口异常时无限翻页。
@@ -101,6 +114,20 @@ pub struct UploadResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub folder: Option<FolderItem>,
     pub parts: usize,
+}
+
+/// 开始分卷上传的返回：目标文件夹 + 已经传上去的块号（断点续传用）。
+#[derive(Serialize, Clone, Debug)]
+pub struct BeginResponse {
+    pub folder_id: String,
+    pub folder_name: String,
+    /// 已经在网盘上的块号（从 1 开始），前端跳过它们
+    pub uploaded: Vec<usize>,
+    pub parts: usize,
+    /// 每块多大。前端按这个切，不用自己记 100M 这个数
+    pub part_size: u64,
+    /// 单个文件多大
+    pub size: u64,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -364,8 +391,9 @@ impl Server {
         let name = if filename.is_empty() { "unnamed" } else { filename };
         let ps = part_size();
 
+        // 长度已知且超过单文件上限：直接走分卷，边读边传，内存里只留一块
         if size_hint > 0 && size_hint as u64 > ps {
-            return self.upload_parts(None, reader, name, folder_id);
+            return self.upload_parts(reader, name, folder_id, size_hint as u64);
         }
 
         let mut body = Vec::new();
@@ -378,8 +406,14 @@ impl Server {
         if body.is_empty() {
             return Err(LzError::Other("空文件".into()));
         }
+
+        // 没声明 Content-Length 的请求：读到上限还溢出了，说明它其实是个大文件。
+        // 分卷要先知道总长才能算块数，所以这里不硬吃进内存（700M 就得占 700M），
+        // 让调用方带上长度、或者改用 /api/upload/begin 那套分块接口。
         if body.len() as u64 > ps {
-            return self.upload_parts(Some(body), reader, name, folder_id);
+            return Err(LzError::Other(
+                "请求里没有长度，超过单文件上限的文件必须声明 Content-Length，或改用分块上传接口".into(),
+            ));
         }
 
         let item = self.lz()?.upload_bytes(name, body, folder_id)?;
@@ -390,80 +424,41 @@ impl Server {
         })
     }
 
-    /// 把 first + rest 当成一条连续字节流，按 part_size 切片，
-    /// 逐块上传到以原文件名新建的文件夹里。
+    /// 分卷上传。和前端走同一套 begin / part / finish：
+    /// 文件夹会复用、网盘上已有的块会跳过，所以中途失败再来一次是**续传**，
+    /// 而不是从头再传一遍、还多出一个「名字_2」文件夹。
+    ///
     fn upload_parts<R: Read>(
         &self,
-        first: Option<Vec<u8>>,
-        rest: R,
+        mut reader: R,
         filename: &str,
         folder_id: i64,
+        size: u64,
     ) -> Result<UploadResponse, LzError> {
-        let (base, ext) = split_name(filename);
-        if ext.is_empty() {
-            return Err(LzError::Other(
-                "文件没有扩展名。蓝奏云不接受无名扩展的分块（会被当成 .001 拒绝），请先给文件加个扩展名".into(),
-            ));
-        }
+        let begin = self.upload_begin(filename, folder_id, size)?;
 
-        let folder_name = self.unique_folder_name(folder_id, filename)?;
-        let fol_id = self
-            .lz()?
-            .new_folder(&folder_name, parent_for_write(folder_id), PARTS_DESC)?;
-        let dest: i64 = fol_id
-            .parse()
-            .map_err(|_| LzError::Other(format!("新建文件夹返回了非数字 id: {fol_id}")))?;
+        for idx in 1..=begin.parts {
+            let (_, want) = part_bounds(size, begin.part_size, idx);
+            let want = want as usize;
 
-        let mut stream: Box<dyn Read> = match first {
-            Some(b) => Box::new(Cursor::new(b).chain(rest)),
-            None => Box::new(rest),
-        };
-
-        let mut buf = vec![0u8; part_size() as usize];
-        let mut idx = 0usize;
-        let mut last: Option<Value> = None;
-
-        loop {
-            let n = read_full(&mut stream, &mut buf)?;
-            if n == 0 {
-                break;
+            // 已经在网盘上的块：把这段读掉就行，不用再传一遍
+            if begin.uploaded.contains(&idx) {
+                io::copy(&mut reader.by_ref().take(want as u64), &mut io::sink())
+                    .map_err(|e| LzError::Http(e.to_string()))?;
+                continue;
             }
-            idx += 1;
 
-            // 上传接口不认 folder_id（实测七种形式全落根目录），
-            // 所以先传到根目录，再移动进目标文件夹。
-            let item = self
-                .lz()?
-                .upload_bytes(&part_name(&base, &ext, idx), buf[..n].to_vec(), ROOT)
-                .map_err(|e| {
-                    LzError::Api(format!(
-                        "第 {idx} 块上传失败（文件夹「{folder_name}」里已有 {} 块）: {e}",
-                        idx - 1
-                    ))
-                })?;
-            let fid = str_of(&item, "id");
-            self.lz()?.move_file(&fid, dest).map_err(|e| {
-                LzError::Api(format!(
-                    "第 {idx} 块移入「{folder_name}」失败（它现在在根目录，id={fid}）: {e}"
-                ))
-            })?;
-            last = Some(item);
+            let mut buf = vec![0u8; want];
+            let n = read_full(&mut reader, &mut buf)?;
+            if n != want {
+                return Err(LzError::Other(format!(
+                    "读第 {idx} 块时只读到 {n} 字节（应该有 {want}），文件被改动过？"
+                )));
+            }
+            self.upload_part(&begin.folder_id, idx, filename, buf)?;
         }
 
-        if idx == 0 {
-            return Err(LzError::Other("空文件".into()));
-        }
-
-        Ok(UploadResponse {
-            file: last.as_ref().map(to_file_item),
-            folder: Some(FolderItem {
-                id: fol_id,
-                name: folder_name,
-                des: PARTS_DESC.to_string(),
-                is_parts: true,
-            }),
-            parts: idx,
-        })
+        self.upload_finish(&begin.folder_id, filename, begin.parts)
     }
 
     /// 避免和已有文件夹重名 —— 重名会让两套分卷混在一起。
@@ -483,6 +478,166 @@ impl Server {
             }
         }
         Err(LzError::Api(format!("同名文件夹太多了，请先清理「{want}」")))
+    }
+
+    // ---------- 分卷上传（前端切块，逐块传） ----------
+    //
+    // 以前是「一个请求传完整个大文件、服务端内部再切块」。700MB 那种要一个请求
+    // 活三分钟以上，中间任何一层掐断都会让整个上传半途而废，而且前端拿不到
+    // 真实进度。改成前端切块、一块一个请求之后：
+    //   - 每个请求最多活几十秒，不会再有"活太久被掐"
+    //   - 进度是真实的分块计数
+    //   - 断点续传变成天然的：begin 会告诉前端哪些块已经在网盘上了
+
+    /// 开始一次分卷上传。
+    ///
+    /// 会先找同名的分卷文件夹 —— **找到就复用**，并把已经传上去的块号返回给前端，
+    /// 这样传一半断了重来时只补缺的那些块。
+    pub fn upload_begin(
+        &self,
+        filename: &str,
+        folder_id: i64,
+        size: u64,
+    ) -> Result<BeginResponse, LzError> {
+        if size == 0 {
+            return Err(LzError::Other("文件是空的".into()));
+        }
+        let part_size = part_size();
+        let parts = part_count(size, part_size);
+        let (base, ext) = split_name(filename);
+        if ext.is_empty() {
+            return Err(LzError::Other(
+                "文件没有扩展名。蓝奏云不接受无名扩展的分块（会被当成 .001 拒绝），请先给文件加个扩展名".into(),
+            ));
+        }
+
+        // 找同名且被标记为分卷的文件夹
+        let (folders, _) = self.lz()?.browse(folder_id)?;
+        let existing = folders
+            .iter()
+            .map(to_folder_item)
+            .find(|f| f.is_parts && f.name == filename);
+
+        let fol = match existing {
+            Some(f) => f,
+            None => {
+                let name = self.unique_folder_name(folder_id, filename)?;
+                let id = self
+                    .lz()?
+                    .new_folder(&name, parent_for_write(folder_id), PARTS_DESC)?;
+                FolderItem {
+                    id,
+                    name,
+                    des: PARTS_DESC.to_string(),
+                    is_parts: true,
+                }
+            }
+        };
+
+        // 扫一遍这个文件夹，看哪些块已经在上面了
+        let dest: i64 = fol
+            .id
+            .parse()
+            .map_err(|_| LzError::Other(format!("文件夹 id 不是数字: {}", fol.id)))?;
+        let re = part_regex();
+        let mut uploaded: Vec<usize> = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let batch = self.lz()?.files(dest, page)?;
+            if batch.is_empty() {
+                break;
+            }
+            for raw in &batch {
+                if let Some(c) = re.captures(&file_name(raw)) {
+                    if c[1] == base && c[3] == ext {
+                        if let Ok(i) = c[2].parse::<usize>() {
+                            uploaded.push(i);
+                        }
+                    }
+                }
+            }
+        }
+        uploaded.sort_unstable();
+
+        Ok(BeginResponse {
+            folder_id: fol.id,
+            folder_name: fol.name,
+            uploaded,
+            parts,
+            part_size,
+            size,
+        })
+    }
+
+    /// 传一块。`idx` 从 1 开始。
+    pub fn upload_part(
+        &self,
+        folder_id: &str,
+        idx: usize,
+        filename: &str,
+        data: Vec<u8>,
+    ) -> Result<(), LzError> {
+        let (base, ext) = split_name(filename);
+        if ext.is_empty() {
+            return Err(LzError::Other("文件没有扩展名".into()));
+        }
+        let dest: i64 = folder_id
+            .parse()
+            .map_err(|_| LzError::Other("文件夹 id 不是数字".into()))?;
+        let want = part_name(&base, &ext, idx);
+
+        // 蓝奏云碰到同名文件是「并存两份」而不是覆盖（实测），所以重传前得先清掉旧的
+        // —— 不然一次失败重试就会留下重复块，合并时序号对不上，整个分卷作废。
+        for page in 1..=MAX_PAGES {
+            let batch = self.lz()?.files(dest, page)?;
+            if batch.is_empty() {
+                break;
+            }
+            for raw in &batch {
+                if file_name(raw) == want {
+                    let _ = self.lz()?.del_file(&str_of(raw, "id"));
+                }
+            }
+        }
+
+        // 上传接口不认 folder_id，所以先传根目录再移动进去
+        let item = self.lz()?.upload_bytes(&want, data, ROOT)?;
+        let fid = str_of(&item, "id");
+        self.lz()?.move_file(&fid, dest)?;
+        Ok(())
+    }
+
+    /// 收尾：核对块数齐了没有。
+    pub fn upload_finish(
+        &self,
+        folder_id: &str,
+        filename: &str,
+        parts: usize,
+    ) -> Result<UploadResponse, LzError> {
+        // part_files 会校验序号连续，缺块会直接报错
+        let refs = self.part_files(folder_id)?;
+        if refs.len() < parts {
+            return Err(LzError::Api(format!(
+                "分卷不完整：应该有 {parts} 块，实际只有 {} 块，缺第 {} 块往后",
+                refs.len(),
+                refs.len() + 1
+            )));
+        }
+        if refs.len() > parts {
+            return Err(LzError::Api(format!(
+                "分卷多出来 {} 块（应该是 {parts} 块），先清一下这个文件夹",
+                refs.len() - parts
+            )));
+        }
+        Ok(UploadResponse {
+            file: None,
+            folder: Some(FolderItem {
+                id: folder_id.to_string(),
+                name: filename.to_string(),
+                des: PARTS_DESC.to_string(),
+                is_parts: true,
+            }),
+            parts,
+        })
     }
 
     // ---------- 分卷下载 ----------
@@ -505,14 +660,7 @@ impl Server {
                 break;
             }
             for raw in &batch {
-                let name = {
-                    let a = str_of(raw, "name_all");
-                    if a.is_empty() {
-                        str_of(raw, "name")
-                    } else {
-                        a
-                    }
-                };
+                let name = file_name(raw);
                 let caps = re
                     .captures(&name)
                     .ok_or_else(|| LzError::Api(format!("文件夹里有不符合分卷命名的文件「{name}」，无法合并")))?;
@@ -706,11 +854,18 @@ pub fn parse_size(text: &str) -> i64 {
     (f * unit) as i64
 }
 
-pub fn to_file_item(raw: &Value) -> FileItem {
-    let mut name = str_of(raw, "name_all");
-    if name.is_empty() {
-        name = str_of(raw, "name");
+/// 文件列表里的名字：优先 name_all（带扩展名），退回 name。
+fn file_name(raw: &Value) -> String {
+    let a = str_of(raw, "name_all");
+    if a.is_empty() {
+        str_of(raw, "name")
+    } else {
+        a
     }
+}
+
+pub fn to_file_item(raw: &Value) -> FileItem {
+    let name = file_name(raw);
     let mut ext = str_of(raw, "icon").to_lowercase();
     if ext.is_empty() || ext == "file" {
         ext = match name.rfind('.') {
@@ -833,6 +988,24 @@ mod tests {
                 assert_eq!(part_name(&b, &e, 1), want_part);
             }
         }
+    }
+
+    #[test]
+    fn part_math_handles_boundaries() {
+        // 上限是闭区间：正好 100 M 是一块，多 1 字节就得两块
+        assert_eq!(part_count(100 << 20, 100 << 20), 1);
+        assert_eq!(part_count((100 << 20) + 1, 100 << 20), 2);
+        // 800 M 那次实测就是 8 块
+        assert_eq!(part_count(838_860_800, 104_857_600), 8);
+
+        let (from, len) = part_bounds(838_860_800, 104_857_600, 1);
+        assert_eq!((from, len), (0, 104_857_600));
+        let (from, len) = part_bounds(838_860_800, 104_857_600, 8);
+        assert_eq!((from, len), (734_003_200, 104_857_600));
+
+        // 最后一块通常是不满的
+        assert_eq!(part_bounds(12_000_000, 5_000_000, 3), (10_000_000, 2_000_000));
+        assert_eq!(part_bounds(5, 5, 1), (0, 5));
     }
 
     #[test]
