@@ -1,0 +1,20 @@
+# Windows 版要真正"单文件"，两个东西都必须静态链进来：
+#
+# 1. WebView2Loader —— webview2-com-sys 只在 MSVC 目标下静态链接它
+#    （GNU 目标会生成对 WebView2Loader.dll 的动态依赖，exe 一启动就报
+#    "找不到 WebView2Loader.dll"）。所以 Windows 版必须用 MSVC 目标，
+#    靠 cargo-xwin 在 Linux 上交叉编译：
+#      cargo install cargo-xwin
+#      apt install clang nasm            # ring 要编 C，需要 clang-cl
+#      apt install lld                   # 要 lld-link
+#      llvm-lib / llvm-rc 也要在 PATH 里
+#
+# 2. MSVC 的 C/C++ 运行时（VCRUNTIME140.dll 等）—— 默认动态依赖，
+#    虽然多数 Windows 装过 VC++ 运行库，但不能保证。crt-static 把它们也编进去。
+#
+# LNK4099 是链接器抱怨静态 CRT 缺 PDB 文件，与产物无关，静音掉。
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=/ignore:4099",
+]

@@ -1,0 +1,43 @@
+[package]
+name = "lzy"
+version = "1.0.0"
+edition = "2021"
+description = "蓝奏云文件管理 —— 单文件桌面版 + 命令行"
+
+[[bin]]
+name = "lzy"
+path = "src/main.rs"
+
+[dependencies]
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+percent-encoding = "2"
+rust-embed = "8"
+
+# 用 rustls 而不是 native-tls：后者在 Windows 上要 OpenSSL，
+# 从 Linux 交叉编译会卡住。rustls 是纯 Rust。
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "cookies",
+    "multipart",
+    "rustls-tls",
+    "gzip",
+] }
+
+# 服务层：同步、简单、够用。这个程序的负载是 I/O 阻塞型，
+# 不值得为它上 tokio。
+tiny_http = "0.12"
+
+[target.'cfg(windows)'.dependencies]
+# 无边框窗口。tao 管窗口，wry 管 webview ——
+# 直接用它俩，不引整个 Tauri（我不需要它的打包器和 IPC 框架）。
+tao = "0.30"
+wry = "0.48"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
